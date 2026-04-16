@@ -10,3 +10,5 @@ lightgbm
 shap
 python-multipart
 openpyxl
+sqlalchemy
+psycopg2-binary

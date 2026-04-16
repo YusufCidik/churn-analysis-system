@@ -4,18 +4,24 @@ import logging
 import os
 import secrets
 from io import BytesIO
+import json
 from pathlib import Path
 from typing import Any
 
 import joblib
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-THRESHOLD = 0.4790
+from app.db.database import Base as DbBase, engine as db_engine, get_db
+from app.db.models import Customer
+from app.ml.engine import TrinityEngine
+from app.repositories.customer_repository import list_customers, upsert_customers, assign_customer, list_users
+
+THRESHOLD = 0.52
 APP_ROOT = Path(__file__).resolve().parent
 MODELS_DIR = APP_ROOT / "models"
 MODEL_PATH = MODELS_DIR / "model.pkl"
@@ -62,6 +68,17 @@ app.add_middleware(
 )
 logger = logging.getLogger("churn_api")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+trinity_engine = TrinityEngine()
+
+
+@app.on_event("startup")
+def _create_tables() -> None:
+    """Create database tables on startup (dev-friendly)."""
+    DbBase.metadata.create_all(bind=db_engine)
+
+# Also create tables at import-time to avoid startup/lifespan gaps in local tooling.
+DbBase.metadata.create_all(bind=db_engine)
 
 model = joblib.load(MODEL_PATH)
 scaler = joblib.load(SCALER_PATH)
@@ -348,6 +365,198 @@ def generate_coupon(payload: CouponRequest) -> dict[str, str | int]:
         "discount_percent": discount,
         "message": message,
     }
+
+
+def _to_python_primitives(obj: Any) -> Any:
+    """Convert pandas/numpy primitives into JSON-serializable Python types."""
+    # Note: keep it simple & robust for portfolio usage.
+    if obj is None:
+        return None
+    if isinstance(obj, (str, int, float, bool)):
+        return obj
+    # pandas/numpy scalars
+    if isinstance(obj, np.generic):
+        return obj.item()
+    # NaN handling
+    try:
+        if pd.isna(obj):
+            return None
+    except Exception:
+        pass
+    if isinstance(obj, dict):
+        return {str(k): _to_python_primitives(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_python_primitives(v) for v in obj]
+    return str(obj)
+
+
+class AnalyzeFileV1Response(BaseModel):
+    """Response shape for POST `/api/v1/analyze-file`."""
+
+    threshold: float
+    count: int
+    upserted: int
+    results: list[dict[str, Any]]
+
+
+class SimulateRequestV1(BaseModel):
+    """Request shape for POST `/api/v1/predict/simulate`."""
+
+    customer: dict[str, Any]
+    monthly_discount_percent: float = 0.0
+
+
+class SimulateResponseV1(BaseModel):
+    """Response shape for POST `/api/v1/predict/simulate`."""
+
+    baseline_churn_probability: float
+    new_churn_probability: float
+    delta_probability: float
+    delta_percent: float
+    baseline_risk_segment: str
+    new_risk_segment: str
+    action_plan_after: str
+    ai_commentary_after: str
+
+
+class AssignRequestV1(BaseModel):
+    """Request schema for assigning a customer to a user."""
+    user_id: int
+
+@app.post("/api/v1/analyze-file", response_model=AnalyzeFileV1Response)
+async def analyze_file_v1(
+    file: UploadFile = File(...), db: Any = Depends(get_db)
+) -> Any:
+    """
+    Analyze uploaded CSV/Excel, run Trinity engine, and upsert results into PostgreSQL.
+    """
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="File name is required.")
+
+    content = await file.read()
+    records = _parse_uploaded_file(file.filename, content)
+    df = pd.DataFrame(records)
+
+    if df.empty:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    if "customer_unique_id" not in df.columns:
+        if "customerID" in df.columns:
+            df["customer_unique_id"] = df["customerID"]
+        elif "customer_id" in df.columns:
+            df["customer_unique_id"] = df["customer_id"]
+        else:
+            df["customer_unique_id"] = [f"CUST-{i + 1:04d}" for i in range(len(df))]
+
+    df = df.replace({np.nan: None})
+
+    required_cats = [
+        c
+        for c in trinity_engine.cat_features
+        if c not in ("contract_tenure", "charge_segment")
+    ]
+    missing = [c for c in required_cats if c not in df.columns]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Missing required categorical columns: {missing}")
+
+    results_for_db: list[dict[str, Any]] = []
+    results_for_response: list[dict[str, Any]] = []
+    for i in range(len(df)):
+        row_dict = df.iloc[i].to_dict()
+        row_dict = _to_python_primitives(row_dict)
+        customer_id = str(row_dict.get("customer_unique_id"))
+        if not customer_id:
+            customer_id = f"CUST-{i + 1:04d}"
+            row_dict["customer_unique_id"] = customer_id
+
+        pred = trinity_engine.predict_one(row_dict)
+        out = {
+            "customer_unique_id": customer_id,
+            "churn_probability": pred.churn_probability,
+            "predicted_clv": pred.predicted_clv,
+            "risk_segment": pred.risk_segment,
+            "action_plan": pred.action_plan,
+            "ai_commentary": pred.ai_commentary,
+        }
+        results_for_db.append({**out, "raw_demographics": row_dict})
+        results_for_response.append(out)
+
+    upserted = upsert_customers(db, results_for_db)
+    return {
+        "threshold": trinity_engine.threshold,
+        "count": len(results_for_response),
+        "upserted": upserted,
+        "results": results_for_response,
+    }
+
+
+@app.post("/api/v1/predict/simulate", response_model=SimulateResponseV1)
+async def simulate_v1(payload: SimulateRequestV1) -> Any:
+    """Simulate monthly discount slider changes and return updated churn probability."""
+    base = trinity_engine.predict_one(payload.customer)
+    new_pred = trinity_engine.simulate_monthly_discount(
+        payload.customer, payload.monthly_discount_percent
+    )
+
+    delta = new_pred.churn_probability - base.churn_probability
+    delta_percent = (delta / base.churn_probability * 100.0) if base.churn_probability else 0.0
+
+    return {
+        "baseline_churn_probability": base.churn_probability,
+        "new_churn_probability": new_pred.churn_probability,
+        "delta_probability": delta,
+        "delta_percent": delta_percent,
+        "baseline_risk_segment": base.risk_segment,
+        "new_risk_segment": new_pred.risk_segment,
+        "action_plan_after": new_pred.action_plan,
+        "ai_commentary_after": new_pred.ai_commentary,
+    }
+
+
+@app.get("/api/v1/customers")
+async def customers_v1(limit: int = 200, db: Any = Depends(get_db)) -> Any:
+    """Fetch latest customers for the Command Center dashboard."""
+    rows = list_customers(db, limit=limit)
+    return [
+        {
+            "id": r.id,
+            "customer_unique_id": r.customer_unique_id,
+            "churn_probability": r.churn_probability,
+            "predicted_clv": r.predicted_clv,
+            "risk_segment": r.risk_segment,
+            "action_plan": r.action_plan,
+            "ai_commentary": r.ai_commentary or r.action_plan,
+            "last_updated": r.last_updated.isoformat() if r.last_updated else None,
+            "customer": r.raw_demographics,
+            "assigned_to_id": r.assigned_to_id,
+        }
+        for r in rows
+    ]
+
+
+@app.patch("/api/v1/customers/{id}/assign")
+async def assign_customer_v1(id: int, payload: AssignRequestV1, db: Any = Depends(get_db)) -> Any:
+    """Admin endpoint to assign a customer to an employee."""
+    success = assign_customer(db, id, payload.user_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    return {"status": "success", "message": f"Customer {id} assigned to user {payload.user_id}"}
+
+
+@app.get("/api/v1/users")
+async def list_users_v1(db: Any = Depends(get_db)) -> Any:
+    """List all users (employees) for the assignment dropdown."""
+    users = list_users(db)
+    return [
+        {"id": u.id, "username": u.username, "role": u.role}
+        for u in users
+    ]
+
+
+@app.post("/api/v1/simulate", response_model=SimulateResponseV1)
+async def simulate_v1_new(payload: SimulateRequestV1) -> Any:
+    """Unified 'What-If' simulation endpoint."""
+    return await simulate_v1(payload)
 
 
 @app.exception_handler(Exception)
