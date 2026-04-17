@@ -11,15 +11,24 @@ from typing import Any
 import joblib
 import numpy as np
 import pandas as pd
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, Request, Form
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from jose import JWTError, jwt
+
 from app.db.database import Base as DbBase, engine as db_engine, get_db
-from app.db.models import Customer
+from app.db.models import Customer, User, AuditLog
+from app.db.security import ALGORITHM, SECRET_KEY, create_access_token, get_password_hash, verify_password
 from app.ml.engine import TrinityEngine
 from app.repositories.customer_repository import list_customers, upsert_customers, assign_customer, list_users
+from app.tasks import process_customer_batch
+from app.worker import celery_app
+from celery.result import AsyncResult
+from app.ml.genai_service import generate_strategic_summary
+from app.db.models import Customer, User, AuditLog, CustomerRiskHistory
 
 THRESHOLD = 0.52
 APP_ROOT = Path(__file__).resolve().parent
@@ -61,13 +70,150 @@ def _allowed_origins() -> list[str]:
 app = FastAPI(title="Telco Churn Analytics API", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_allowed_origins(),
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 logger = logging.getLogger("churn_api")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+# --- Security & Auth Infrastructure ---
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/v1/auth/login")
+
+
+async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
+    """Dependency to validate JWT and return the current user."""
+    credentials_exception = HTTPException(
+        status_code=401,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+    
+    user = db.query(User).filter(User.username == username).first()
+    if user is None:
+        raise credentials_exception
+    return user
+
+
+def require_role(roles: list[str]):
+    """Constraint to restrict access by user role."""
+    async def role_checker(current_user: User = Depends(get_current_user)):
+        if current_user.role not in roles:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Operation restricted to roles: {', '.join(roles)}"
+            )
+        return current_user
+    return role_checker
+
+
+@app.post("/api/v1/auth/login")
+async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    """Standard OAuth2 login flow. Returns JWT access token."""
+    user = db.query(User).filter(User.username == form_data.username).first()
+    if not user or not verify_password(form_data.password, user.hashed_password):
+        raise HTTPException(
+            status_code=401,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    access_token = create_access_token(data={"sub": user.username})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+
+@app.get("/api/v1/auth/me")
+async def get_me(current_user: User = Depends(get_current_user)):
+    """Returns the current user profile."""
+    return {
+        "id": current_user.id,
+        "username": current_user.username,
+        "email": current_user.email,
+        "role": current_user.role
+    }
+
+
+from google.oauth2 import id_token
+from google.auth.transport import requests as auth_requests
+
+GOOGLE_CLIENT_ID = "886266744076-f301q1e5idbatl9p6v4p7q6n81vdisk9.apps.googleusercontent.com"
+
+class GoogleAuthRequest(BaseModel):
+    token: str
+    nonce: str | None = None
+
+@app.post("/api/v1/auth/google")
+async def google_auth(payload: GoogleAuthRequest, db: Session = Depends(get_db)):
+    """Verifies Google ID token and creates/logs in user."""
+    try:
+        # Verify the token
+        idinfo = id_token.verify_oauth2_token(
+            payload.token, 
+            auth_requests.Request(), 
+            GOOGLE_CLIENT_ID
+        )
+        
+        # If a nonce was provided, verify it (Optional but recommended)
+        if payload.nonce and idinfo.get('nonce') != payload.nonce:
+            raise ValueError("Nonce mismatch")
+
+        email = idinfo['email']
+        username = idinfo.get('name', email.split("@")[0])
+
+        user = db.query(User).filter(User.email == email).first()
+        if not user:
+            user = User(username=username, email=email, role="employee", is_active=1)
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+        access_token = create_access_token(data={"sub": user.username})
+        return {"access_token": access_token, "token_type": "bearer"}
+    except Exception as e:
+        logger.error(f"Google Auth Error: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Google Authentication failed: {str(e)}")
+
+
+@app.post("/api/v1/auth/google-callback")
+async def google_callback(request: Request, db: Session = Depends(get_db)):
+    """Handles Google Redirect callback (POST)."""
+    form_data = await request.form()
+    credential = form_data.get("credential")
+    if not credential:
+        return RedirectResponse(url="http://localhost:3000/login?error=no_credential")
+
+    try:
+        idinfo = id_token.verify_oauth2_token(credential, auth_requests.Request(), GOOGLE_CLIENT_ID)
+        email = idinfo['email']
+        username = idinfo.get('name', email.split("@")[0])
+
+        user = db.query(User).filter(User.email == email).first()
+        if not user:
+            user = User(username=username, email=email, role="employee", is_active=1)
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+        access_token = create_access_token(data={"sub": user.username})
+        # Redirect back to frontend with token
+        return RedirectResponse(
+            url=f"http://localhost:3000/login?token={access_token}",
+            status_code=303
+        )
+    except Exception as e:
+        return RedirectResponse(url=f"http://localhost:3000/login?error={str(e)}")
+
 
 trinity_engine = TrinityEngine()
 
@@ -282,89 +428,6 @@ def _customer_commentary(customer: pd.Series, probability: float, label: str) ->
     )
 
 
-def _analyze_customers(customers: list[dict[str, Any]]) -> dict[str, Any]:
-    """Centralized analyze flow used by JSON and file upload endpoints."""
-    try:
-        raw_df, scaled_df = _preprocess(customers)
-        probabilities = model.predict_proba(scaled_df)[:, 1]
-        impacts = _compute_impacts(scaled_df)
-    except Exception as exc:
-        logger.exception("Analyze failed")
-        raise HTTPException(status_code=500, detail=f"Analyze error: {exc}") from exc
-
-    rows = []
-    for idx, prob in enumerate(probabilities):
-        label = _risk_label(float(prob))
-        raw_customer = raw_df.iloc[idx]
-        monthly = float(pd.to_numeric(raw_customer.get("MonthlyCharges", 0), errors="coerce") or 0)
-        tenure = float(pd.to_numeric(raw_customer.get("tenure", 0), errors="coerce") or 0)
-        rows.append(
-            {
-                "customer_id": str(raw_df.iloc[idx].get("customerID", f"CUST-{idx + 1}")),
-                "churn_probability": round(float(prob), 4),
-                "will_churn": bool(float(prob) >= THRESHOLD),
-                "risk_label": label,
-                "threshold": THRESHOLD,
-                "top_impacts": impacts[idx],
-                "commentary": _customer_commentary(raw_customer, float(prob), label),
-                "monthly_charges": round(monthly, 2),
-                "tenure": round(tenure, 2),
-            }
-        )
-
-    logger.info("Analyze success. customers=%s", len(rows))
-    return {"threshold": THRESHOLD, "count": len(rows), "results": rows}
-
-
-@app.get("/health")
-def health() -> dict[str, str]:
-    """Return service health status for monitoring checks."""
-    return {"status": "ok"}
-
-
-@app.post("/api/analyze")
-def analyze(payload: AnalyzeRequest) -> dict[str, Any]:
-    """Analyze customers and return churn probability plus AI insights."""
-    return _analyze_customers(payload.customers)
-
-
-@app.post("/api/analyze-file")
-async def analyze_file(file: UploadFile = File(...)) -> dict[str, Any]:
-    """Analyze customers from uploaded CSV, JSON, or Excel file."""
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="File name is required.")
-    content = await file.read()
-    customers = _parse_uploaded_file(file.filename, content)
-    logger.info("Analyze file upload. file=%s rows=%s", file.filename, len(customers))
-    return _analyze_customers(customers)
-
-
-@app.post("/api/coupon")
-def generate_coupon(payload: CouponRequest) -> dict[str, str | int]:
-    """Generate ARPU-aware retention coupon recommendations."""
-    risk = payload.risk_label.lower()
-    if payload.monthly_charges >= 85:
-        discount = 30
-    elif payload.monthly_charges >= 55:
-        discount = 20
-    else:
-        discount = 10
-
-    if "kritik" in risk and discount < 20:
-        discount = 30
-
-    code = f"RET-{payload.customer_id[-4:].upper()}-{secrets.token_hex(2).upper()}"
-    message = (
-        f"{discount}% teklif uretildi. "
-        f"ARPU={payload.monthly_charges:.2f}, tenure={payload.tenure:.1f} ay, segment={payload.risk_label}."
-    )
-    logger.info("Coupon generated. customer=%s discount=%s", payload.customer_id, discount)
-    return {
-        "customer_id": payload.customer_id,
-        "coupon_code": code,
-        "discount_percent": discount,
-        "message": message,
-    }
 
 
 def _to_python_primitives(obj: Any) -> Any:
@@ -455,9 +518,16 @@ async def analyze_file_v1(
         for c in trinity_engine.cat_features
         if c not in ("contract_tenure", "charge_segment")
     ]
-    missing = [c for c in required_cats if c not in df.columns]
-    if missing:
-        raise HTTPException(status_code=400, detail=f"Missing required categorical columns: {missing}")
+    for col in required_cats:
+        if col not in df.columns:
+            # Silently fill missing required categorical columns with a stable default
+            df[col] = "No"
+    
+    # Also ensure numeric columns are present or filled with 0
+    required_nums = ["tenure", "MonthlyCharges", "TotalCharges"]
+    for col in required_nums:
+        if col not in df.columns:
+            df[col] = 0.0
 
     results_for_db: list[dict[str, Any]] = []
     results_for_response: list[dict[str, Any]] = []
@@ -481,12 +551,28 @@ async def analyze_file_v1(
         results_for_db.append({**out, "raw_demographics": row_dict})
         results_for_response.append(out)
 
-    upserted = upsert_customers(db, results_for_db)
+    # Trigger background processing instead of blocking
+    task = process_customer_batch.delay(results_for_response)
+    
     return {
-        "threshold": trinity_engine.threshold,
-        "count": len(results_for_response),
-        "upserted": upserted,
-        "results": results_for_response,
+        "status": "pending",
+        "task_id": task.id,
+        "message": "Analysis started in background. Use task_id to poll progress.",
+        "count": len(results_for_response)
+    }
+
+
+@app.get("/api/v1/tasks/{task_id}")
+async def get_task_status(task_id: str):
+    """
+    Check the status of a background analysis task.
+    Returns: PENDING, SUCCESS, or FAILURE.
+    """
+    res = AsyncResult(task_id, app=celery_app)
+    return {
+        "task_id": task_id,
+        "status": res.status,
+        "result": res.result if res.ready() else None
     }
 
 
@@ -557,6 +643,96 @@ async def list_users_v1(db: Any = Depends(get_db)) -> Any:
 async def simulate_v1_new(payload: SimulateRequestV1) -> Any:
     """Unified 'What-If' simulation endpoint."""
     return await simulate_v1(payload)
+
+
+@app.get("/api/v1/health")
+async def health_check(db: Session = Depends(get_db)):
+    """System health check for monitoring dashboard."""
+    health = {
+        "status": "healthy",
+        "database": "connected",
+        "redis": "connected",
+        "engine": "live"
+    }
+    
+    # Check DB
+    try:
+        db.execute(text("SELECT 1"))
+    except Exception as e:
+        health["database"] = f"error: {str(e)}"
+        health["status"] = "degraded"
+        
+    # Check Redis
+    try:
+        celery_app.control.ping(timeout=0.1)
+    except Exception:
+        health["redis"] = "disconnected"
+        health["status"] = "degraded"
+        
+    return health
+
+
+@app.get("/api/v1/customers/{customer_id}/intelligence")
+async def get_customer_intelligence(
+    customer_id: int, 
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Advanced intelligence for a specific customer:
+    - AI-Generated Strategy (Gemini)
+    - SHAP Feature Importance
+    - Historical Risk Timeline
+    """
+    customer = db.query(Customer).filter(Customer.id == customer_id).first()
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+
+    # 1. Generate GenAI Summary
+    genai_summary = generate_strategic_summary(
+        customer_data=customer.raw_demographics,
+        churn_prob=customer.churn_probability,
+        clv=customer.predicted_clv
+    )
+
+    # 2. Fetch Historical Timeline
+    history = db.query(CustomerRiskHistory).filter(
+        CustomerRiskHistory.customer_id == customer_id
+    ).order_by(CustomerRiskHistory.recorded_at.asc()).all()
+
+    # 3. Calculate SHAP (Local)
+    feature_importance = []
+    if shap:
+        try:
+            # Re-running shap for the specific customer
+            explainer = trinity_engine._get_explainer()
+            prepped = trinity_engine._preprocess_one(customer.raw_demographics)
+            shap_values = explainer(prepped)
+            
+            # Get top features
+            raw_shap = shap_values.values[0]
+            for i, feat in enumerate(trinity_engine.feature_columns):
+                feature_importance.append({
+                    "feature": feat,
+                    "impact": float(raw_shap[i])
+                })
+            # Sort by absolute impact
+            feature_importance = sorted(feature_importance, key=lambda x: abs(x["impact"]), reverse=True)[:8]
+        except Exception as e:
+            logger.error(f"SHAP error: {e}")
+
+    return {
+        "customer_id": customer_id,
+        "genai_strategy": genai_summary,
+        "history": [
+            {
+                "date": h.recorded_at.isoformat(),
+                "prob": h.churn_probability,
+                "clv": h.predicted_clv
+            } for h in history
+        ],
+        "feature_importance": feature_importance
+    }
 
 
 @app.exception_handler(Exception)

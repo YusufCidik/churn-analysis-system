@@ -9,13 +9,13 @@ from typing import Any
 import pandas as pd
 import numpy as np
 
-# Ensure `backend/` is on the Python path
+# Path logic for finding models and data
 ROOT_DIR = Path(__file__).resolve().parents[1]
-BACKEND_DIR = ROOT_DIR / "backend"
-sys.path.insert(0, str(BACKEND_DIR))
+# Note: In Docker, ROOT_DIR is /app. In local dev, it is project_root/backend.
 
 from app.db.database import Base, engine, SessionLocal
 from app.db.models import User, Customer
+from app.db.security import get_password_hash
 from app.ml.engine import TrinityEngine
 from app.repositories.customer_repository import upsert_customers
 
@@ -41,18 +41,26 @@ def _to_python_primitives(obj: Any) -> Any:
 
 
 def setup_users(db: SessionLocal):
-    """Seed initial users."""
+    """Seed initial users with hashed passwords."""
+    # Default password for all seeded users is 'trinity123'
+    default_hashed = get_password_hash("trinity123")
+    
     users = [
-        {"username": "admin", "role": "admin"},
-        {"username": "jdoe", "role": "employee"},
-        {"username": "asmith", "role": "employee"},
-        {"username": "bgates", "role": "employee"},
+        {"username": "admin", "role": "admin", "email": "admin@trinity.ai", "hashed_password": default_hashed},
+        {"username": "jdoe", "role": "employee", "email": "jdoe@trinity.ai", "hashed_password": default_hashed},
+        {"username": "asmith", "role": "employee", "email": "asmith@trinity.ai", "hashed_password": default_hashed},
+        {"username": "bgates", "role": "employee", "email": "bgates@trinity.ai", "hashed_password": default_hashed},
     ]
     for u_data in users:
         exists = db.query(User).filter(User.username == u_data["username"]).first()
         if not exists:
             user = User(**u_data)
             db.add(user)
+        else:
+            # Update existing users if they don't have a password
+            if not exists.hashed_password:
+                exists.hashed_password = default_hashed
+                exists.email = u_data["email"]
     db.commit()
 
 
@@ -73,8 +81,10 @@ def main() -> None:
         logger.error("Master CSV not found at %s. Creating empty or skipping.", csv_path)
         return
 
-    # Create tables
-    logger.info("Initializing database tables...")
+    # Reset and Create tables (SaaS Setup Mode)
+    logger.info("Dropping existing tables to ensure clean schema sync...")
+    Base.metadata.drop_all(bind=engine)
+    logger.info("Initializing fresh database tables...")
     Base.metadata.create_all(bind=engine)
 
     db = SessionLocal()

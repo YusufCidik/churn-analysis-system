@@ -12,3 +12,11 @@ python-multipart
 openpyxl
 sqlalchemy
 psycopg2-binary
+passlib[argon2]
+python-jose[cryptography]
+celery
+redis
+google-generativeai
+authlib
+httpx
+google-auth
